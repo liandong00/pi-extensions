@@ -17,6 +17,7 @@ import {
   type AgyTurnExecutor,
 } from "../lib/agy-driver.ts";
 import type { AgyExecutionMode } from "../lib/agy-profile.ts";
+import type { AgySandboxOptions } from "../lib/agy-sandbox.ts";
 import type { AgyTurnOutcome, AgyUsage } from "../lib/reducer.ts";
 import { stallContinuationPrompt } from "../lib/prompt.ts";
 import { AgyTurnController } from "../lib/turn.ts";
@@ -108,19 +109,19 @@ export interface AntigravityRuntimeShape {
     readonly prompt: string;
     /** Active pi-branch history used only when a fresh agy conversation needs restoring. */
     readonly historyBootstrap?: string;
-    /**
-     * Extra prompt text appended ONLY when this request starts a fresh agy
-     * conversation (bootstrap). agy keeps full conversation history, so
-     * re-sending it on `--conversation` resumes would duplicate the block on
-     * every user turn. Ignored on re-attach, and excluded from the re-attach
-     * prompt match, which uses the base prompt.
-     */
-    readonly bootstrapSuffix?: string;
+    /** Pi system instructions, injected only when starting a fresh agy conversation. */
+    readonly bootstrapPrefix?: string;
     readonly modelId: string;
     readonly effort?: "low" | "medium" | "high";
     readonly agent?: string;
     readonly mode?: AgyExecutionMode;
     readonly bridgeRevision?: string;
+    /** Empty broker workspace used by the agy process instead of the real project. */
+    readonly processCwd?: string;
+    /** Provider-owned Gemini directory carrying the strict agy profile. */
+    readonly geminiDir?: string;
+    /** Mandatory OS sandbox configuration for the official agy process. */
+    readonly sandbox?: AgySandboxOptions;
     readonly signal?: AbortSignal;
   }) => Effect.Effect<AgyTurnController, AntigravityRuntimeClosedError>;
   /** Clear the active controller once a provider turn reached a terminal state. */
@@ -135,6 +136,8 @@ export interface AntigravityRuntimeShape {
     readonly tool: string;
     readonly args: Record<string, unknown>;
   }) => boolean;
+  /** Kill the active agy process and discard its conversation after a native-tool escape attempt. */
+  readonly abortSecurityViolation: Effect.Effect<void, AntigravityRuntimeClosedError>;
   readonly reset: Effect.Effect<void, AntigravityRuntimeClosedError>;
   readonly snapshot: Effect.Effect<AntigravityStateSnapshot, AntigravityRuntimeClosedError>;
   readonly close: Effect.Effect<void, AntigravityRuntimeClosedError>;
@@ -174,7 +177,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
     let generation = 0;
     let restoreHistoryOnNextConversation = false;
     let restoredConversationPending = false;
-    let lastBootstrappedSkillsSuffix: string | undefined;
 
     const invalidateActiveTurn = () => {
       generation += 1;
@@ -224,7 +226,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 turns = 0;
                 restoreHistoryOnNextConversation = true;
                 restoredConversationPending = false;
-                lastBootstrappedSkillsSuffix = undefined;
               }
             }),
           ),
@@ -243,7 +244,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
               turns = state.turns;
               restoreHistoryOnNextConversation = false;
               restoredConversationPending = true;
-              lastBootstrappedSkillsSuffix = undefined;
             }),
           ),
         ),
@@ -271,7 +271,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 conversationCwd = undefined;
                 restoreHistoryOnNextConversation = true;
                 restoredConversationPending = false;
-                lastBootstrappedSkillsSuffix = undefined;
               }
               if (model !== undefined && model !== request.modelId) {
                 conversationId = undefined;
@@ -279,7 +278,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 conversationCwd = undefined;
                 restoreHistoryOnNextConversation = true;
                 restoredConversationPending = false;
-                lastBootstrappedSkillsSuffix = undefined;
               }
               model = request.modelId;
               const controller = new AgyTurnController(request.prompt, conversationUsage);
@@ -304,23 +302,18 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   ? request.historyBootstrap
                   : undefined;
               restoreHistoryOnNextConversation = false;
-              // Direct-mode skill paths ride the prompt when the bridge is
-              // disabled or registration failed. If the bridge was active
-              // initially and later fails mid-conversation, or if the skill
-              // catalog changes, the new suffix is appended even when an agy
-              // conversation already exists. Suffixes already sent to the
-              // current conversation are not duplicated on every turn.
-              const bootstrapSuffix =
-                request.bootstrapSuffix && request.bootstrapSuffix !== lastBootstrappedSkillsSuffix
-                  ? request.bootstrapSuffix
-                  : undefined;
               let restoredAttemptActive = resumingPersistedConversation;
               let restoredResultMissing = false;
-              const freshRestorePrompt = [request.historyBootstrap, request.prompt, bootstrapSuffix]
+              const bootstrapPrefix = !conversationId ? request.bootstrapPrefix : undefined;
+              const freshRestorePrompt = [
+                request.bootstrapPrefix,
+                request.historyBootstrap,
+                request.prompt,
+              ]
                 .filter((part): part is string => Boolean(part))
                 .join("\n\n");
               const spawnRequest: AgyTurnRequest = {
-                prompt: [historyBootstrap, request.prompt, bootstrapSuffix]
+                prompt: [bootstrapPrefix, historyBootstrap, request.prompt]
                   .filter((part): part is string => Boolean(part))
                   .join("\n\n"),
                 conversationId,
@@ -329,7 +322,9 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                 agent: request.agent,
                 mode: request.mode,
                 bridgeRevision: request.bridgeRevision,
-                cwd,
+                cwd: request.processCwd ?? cwd,
+                geminiDir: request.geminiDir,
+                sandbox: request.sandbox,
                 timeoutMs: envInt("AGY_TURN_TIMEOUT_MS", 600_000),
                 inactivityTimeoutMs: envInt("AGY_STALL_TIMEOUT_MS", 120_000),
                 toolInactivityTimeoutMs: envInt("AGY_TOOL_STALL_TIMEOUT_MS", 300_000),
@@ -340,10 +335,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   // resolve, and /agy-tasks needs the id meanwhile.
                   conversationId = id;
                   conversationCwd = cwd;
-                  // Prompt reached the conversation: commit the bootstrap suffix.
-                  if (bootstrapSuffix) {
-                    lastBootstrappedSkillsSuffix = bootstrapSuffix;
-                  }
                 },
                 onActivity: (activity) => {
                   if (turnGeneration !== generation) return;
@@ -452,9 +443,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
                   if (outcome.conversationId) conversationId = outcome.conversationId;
                   if (outcome.usage) conversationUsage = { ...outcome.usage };
                   restoredConversationPending = false;
-                  if (bootstrapSuffix) {
-                    lastBootstrappedSkillsSuffix = bootstrapSuffix;
-                  }
                   controller.close();
                 })
                 .catch((cause: unknown) => {
@@ -485,6 +473,20 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
         return true;
       },
 
+      abortSecurityViolation: ensureOpen.pipe(
+        Effect.andThen(
+          Effect.promise(async () => {
+            await recycle("abort", "security-violation");
+            conversationId = undefined;
+            conversationUsage = {};
+            conversationCwd = undefined;
+            turns = 0;
+            restoreHistoryOnNextConversation = true;
+            restoredConversationPending = false;
+          }),
+        ),
+      ),
+
       reset: ensureOpen.pipe(
         Effect.andThen(
           Effect.promise(async () => {
@@ -495,7 +497,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
             turns = 0;
             restoreHistoryOnNextConversation = false;
             restoredConversationPending = false;
-            lastBootstrappedSkillsSuffix = undefined;
           }),
         ),
       ),
@@ -522,7 +523,6 @@ const makeRuntime = (executor: AgyTurnExecutor) =>
               conversationUsage = {};
               conversationCwd = undefined;
               restoredConversationPending = false;
-              lastBootstrappedSkillsSuffix = undefined;
               await recycle("shutdown");
             }),
           ),

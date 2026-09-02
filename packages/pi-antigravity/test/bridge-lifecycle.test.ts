@@ -42,3 +42,30 @@ test("bridge lifecycle process revision combines registration generation and cat
     await manager.teardown();
   }
 });
+
+test("bridge lifecycle closes a listener created by a failed registration and can retry", async () => {
+  const bridge = new AgyPiBridge("pi-bridge-retry");
+  let attempts = 0;
+  const warnings: string[] = [];
+  const manager = createBridgeLifecycleManager({
+    bridge,
+    bridgeToken: "token",
+    addMcpServer: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error("broker unavailable");
+    },
+    removeMcpServer: async () => {},
+    evictMcpCache: async () => {},
+  });
+  try {
+    assert.equal(await manager.ensureRegistered((warning) => warnings.push(warning)), false);
+    assert.equal(bridge.running, false);
+    assert.deepEqual(warnings, ["antigravity: pi-tool bridge unavailable (broker unavailable)."]);
+
+    assert.equal(await manager.ensureRegistered(), true);
+    assert.equal(bridge.running, true);
+    assert.equal(manager.isRegistered(), true);
+  } finally {
+    await manager.teardown();
+  }
+});

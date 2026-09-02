@@ -1,8 +1,8 @@
 // antigravity — use Google Antigravity (agy) models inside the pi coding
 // agent via the agy stream-json RPC. pi stays the UI: model picker, portable
-// sessions, and rendering; agy owns native context and runs the selected model with
-// --dangerously-skip-permissions always enabled (headless agy turns
-// auto-deny tools that would need a permission prompt otherwise).
+// sessions, permissions, tools, and rendering; agy owns only native model context.
+// The agy process runs from an empty broker workspace with a strict isolated
+// profile and can reach the real project only through Pi's authenticated bridge.
 //
 // Commands:
 //   /agy            show agy conversation and persistent-driver status
@@ -18,31 +18,34 @@ import type {
   ExtensionUIContext,
   ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
-import { stripTerminalSequences, Text, truncateToWidth } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
+import { stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
 import { piConfigDir, readJson, writeJson } from "./lib/config.ts";
 import { installAgyDeathHooks, killAllAgyTrees } from "./lib/agy-children.ts";
 import { checkAgyBinary, MIN_AGY_VERSION, runAgyCommand } from "./lib/agy-diagnostics.ts";
 import { parseAgyAgents, readAgyProcessProfile } from "./lib/agy-profile.ts";
-import { pruneBridgeMcpCache, removeMcpCacheEntry } from "./lib/mcp-cache.ts";
-import {
-  AgyPiBridge,
-  BRIDGE_SERVER_NAME,
-  selectBridgedTools,
-  type PiToolInfo,
-} from "./lib/bridge.ts";
+import { AgyPiBridge, selectBridgedTools, type PiToolInfo } from "./lib/bridge.ts";
 import { createBridgeLifecycleManager } from "./lib/bridge-lifecycle.ts";
 import {
   ACTIVATE_SKILL_TOOL_NAME,
   activateSkillDescription,
   activateSkillParameters,
   handleActivateSkill,
-  nonWorkspaceSkills,
   usableSkillCatalog,
   type SkillLite,
 } from "./lib/skills.ts";
+import {
+  prepareAgySecurityProfile,
+  recoverStaleBridgeLock,
+  registerSessionBridge,
+  resolveAgySecurityProfile,
+  SECURE_BRIDGE_SERVER_NAME,
+  SECURE_BRIDGE_TOOL_PREFIX,
+  sessionBroker,
+  unregisterSessionBridge,
+  type AgySessionBroker,
+} from "./lib/security-profile.ts";
 import {
   capabilitiesForModel,
   FALLBACK_MODELS,
@@ -69,16 +72,13 @@ import {
   type PersistedAgyReset,
 } from "./lib/conversation-state.ts";
 import { readAgyConversationMetadata } from "./lib/conversation-metadata.ts";
-import { AgyReplayStore, type RecordedAgyTool } from "./lib/replay.ts";
 import { findAgyTask, listAgyTasks, stopAgyTask } from "./lib/tasks.ts";
 import { findAgyArtifact, listAgyArtifacts } from "./lib/artifacts.ts";
 import { fetchAgyUsage } from "./lib/usage.ts";
-import { WRAPPER_TOOL_DESCRIPTION, WRAPPER_TOOL_NAME } from "./lib/prompt.ts";
-import { wrapperToolActiveAfterModelSwitch } from "./lib/wrapper-activation.ts";
+import { appendAgySecurityEvent } from "./lib/security-events.ts";
 import { openAgyTasksPicker } from "./src/tasks-ui.ts";
 import { openArtifact, openAgyArtifactsPicker } from "./src/artifacts-ui.ts";
 import { openAgyUsagePicker } from "./src/usage-ui.ts";
-import { agyToolLabel, formatAgyCall, summarizeAgyResult } from "./lib/render.ts";
 import { mapThinkingToEffort, streamAntigravity } from "./src/provider.ts";
 import {
   AntigravityRuntime,
@@ -89,6 +89,13 @@ import {
 
 const MODEL_CACHE_FILE = path.join(piConfigDir("antigravity"), "model-list.json");
 const DISCOVERY_TIMEOUT_MS = 15_000;
+const SECURITY_PROFILE = resolveAgySecurityProfile();
+const AGY_BRAIN_DIR = path.join(SECURITY_PROFILE.appDataDir, "brain");
+const AGY_METADATA_FILE = path.join(
+  SECURITY_PROFILE.appDataDir,
+  "cache",
+  "conversation_metadata.json",
+);
 
 function statusOneLine(value: string, maxLength = 160): string {
   return stripTerminalSequences(value)
@@ -102,57 +109,19 @@ function statusOneLine(value: string, maxLength = 160): string {
 
 const BRIDGE_ENABLED = process.env.PI_ANTIGRAVITY_PI_TOOL_BRIDGE !== "0";
 
-/** Timeout for shutdown-path agy calls — fast enough not to stall closing pi. */
-const SHUTDOWN_AGY_TIMEOUT_MS = 5_000;
-
 async function execAgy(args: string[], timeoutMs = DISCOVERY_TIMEOUT_MS): Promise<string> {
-  return (await runAgyCommand(args, { timeoutMs })).stdout;
-}
-
-/**
- * Remove `pi-bridge-*` MCP registrations whose loopback server is no longer
- * reachable. Registrations live in agy's GLOBAL config while bridge servers
- * are per-pi-session: crashed sessions leak registrations forever, and every
- * live session's tools are merged into every agy turn's tools/list. Pruning
- * dead entries on startup keeps cross-session pollution to live sessions.
- * agy also caches tool manifests on disk per server
- * (`~/.gemini/antigravity-cli/mcp/<name>/`) and never evicts them, so the
- * same sweep prunes cache entries with no live server left.
- */
-async function pruneStaleBridgeRegistrations(): Promise<void> {
-  let list: string;
-  try {
-    list = await execAgy(["mcp", "list"]);
-  } catch {
-    return; // agy unavailable — registration below will warn instead
-  }
-  const stale: string[] = [];
-  const live: string[] = [];
-  for (const line of list.split("\n").slice(1)) {
-    const columns = line.trim().split(/\s+/);
-    const name = columns[0] ?? "";
-    const url = columns[columns.length - 1] ?? "";
-    if (!name.startsWith(`${BRIDGE_SERVER_NAME}-`) || !/^http:\/\/127\.0\.0\.1:\d+\//.test(url)) {
-      continue;
-    }
-    try {
-      await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "ping" }),
-        signal: AbortSignal.timeout(1_500),
-      });
-      // Any HTTP answer (even 403/404) means a server is still listening.
-      live.push(name);
-    } catch {
-      stale.push(name);
-    }
-  }
-  await Promise.all(stale.map((name) => execAgy(["mcp", "remove", name]).catch(() => {})));
-  // `agy mcp remove` deregisters but leaves the on-disk manifest cache
-  // behind; entries whose registration is already gone never reappear in
-  // `agy mcp list`, so prune the cache against the live set here.
-  await pruneBridgeMcpCache({ liveServers: live });
+  await prepareAgySecurityProfile(SECURITY_PROFILE);
+  return (
+    await runAgyCommand([`--gemini_dir=${SECURITY_PROFILE.geminiDir}`, ...args], {
+      timeoutMs,
+      cwd: SECURITY_PROFILE.brokerRoot,
+      sandbox: {
+        required: true,
+        geminiDir: SECURITY_PROFILE.geminiDir,
+        brokerCwd: SECURITY_PROFILE.brokerRoot,
+      },
+    })
+  ).stdout;
 }
 
 interface ModelCache {
@@ -241,11 +210,12 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   installAgyDeathHooks();
   const runtime = createAntigravityRuntime();
   const service = runtime.runSync(AntigravityRuntime);
-  const replay = new AgyReplayStore();
   let currentCache = getInitialModelCache();
   let observedContextTokens: number | undefined;
   let persistedConversationKey: string | undefined;
   let selectedModelKey: string | undefined;
+  let activeBroker: AgySessionBroker | undefined;
+  let activePiSessionId: string | undefined;
 
   pi.registerEntryRenderer(AGY_COMPACTION_ENTRY, (entry, _options, theme) => {
     const marker = entry.data as AgyCompactionMarker;
@@ -303,38 +273,24 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
 
   // --- Pi-tool bridge setup -------------------------------------------------
 
-  const bridge = new AgyPiBridge(`${BRIDGE_SERVER_NAME}-${process.pid}`);
+  const bridge = new AgyPiBridge(SECURE_BRIDGE_SERVER_NAME);
   const bridgeToken = randomUUID();
   bridge.requireToken(bridgeToken);
-  // Session-unique tool prefix: agy's MCP config is global, so concurrent pi
-  // sessions' bridges all appear in every agy turn's tools/list. Namespacing
-  // each session's tools makes tool→server routing unambiguous — a call can
-  // only reach the session that advertised it.
-  const bridgeToolPrefix = `pi__p${process.pid}__`;
-  bridge.setToolPrefix(bridgeToolPrefix);
+  bridge.setToolPrefix(SECURE_BRIDGE_TOOL_PREFIX);
   bridge.setOnCall((call) => service.pushBridgeCall(call));
 
   const bridgeManager = createBridgeLifecycleManager({
     bridge,
     bridgeToken,
     enabled: BRIDGE_ENABLED,
-    pruneStaleRegistrations: pruneStaleBridgeRegistrations,
-    addMcpServer: async (serverName, url, token) => {
-      await execAgy([
-        "mcp",
-        "add",
-        "--type",
-        "http",
-        "--header",
-        `x-pi-bridge-token: ${token}`,
-        serverName,
-        url,
-      ]);
+    addMcpServer: async (_serverName, url, token) => {
+      if (!activeBroker) throw new Error("no Pi session broker is active.");
+      await registerSessionBridge(SECURITY_PROFILE, activeBroker, url, token);
     },
-    removeMcpServer: async (serverName) => {
-      await execAgy(["mcp", "remove", serverName], SHUTDOWN_AGY_TIMEOUT_MS);
+    removeMcpServer: async () => {
+      if (activeBroker) await unregisterSessionBridge(SECURITY_PROFILE, activeBroker);
     },
-    evictMcpCache: removeMcpCacheEntry,
+    evictMcpCache: async () => {},
   });
 
   /**
@@ -344,7 +300,12 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
    * 2026-08-21) — so this runs as soon as an Antigravity model is selected.
    */
   async function ensureBridgeRegistered(ui?: ExtensionUIContext): Promise<void> {
-    await bridgeManager.ensureRegistered((warning) => ui?.notify(warning, "warning"));
+    const registered = await bridgeManager.ensureRegistered((warning) =>
+      ui?.notify(warning, "warning"),
+    );
+    if (!registered) {
+      throw new Error("antigravity: secure Pi bridge registration failed; refusing to start agy.");
+    }
   }
 
   /**
@@ -376,17 +337,9 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       }));
   }
 
-  const bridgedSkills = () => usableSkillCatalog(nonWorkspaceSkills(loadedSkills, tasksSessionCwd));
+  const bridgedSkills = () => usableSkillCatalog(loadedSkills);
 
-  /**
-   * Bridge mode keeps the catalog in activate_skill's schema (refreshed on
-   * every agy spawn), so nothing is appended to the prompt. When the bridge is
-   * off OR failed to register with agy, fall back to the direct-mode path
-   * catalog so skills never become silently invisible.
-   */
-  const getBootstrapSuffix = () => bridgeManager.getBootstrapSuffix(bridgedSkills());
-
-  /** Publish one `pi__p<pid>__activate_skill` tool for global pi skills. */
+  /** Publish one `pi__activate_skill` tool for Pi-discovered skills. */
   function refreshSkillTools(): void {
     if (!BRIDGE_ENABLED) return;
     const skills = bridgedSkills();
@@ -433,15 +386,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   let agyAgentActive = false;
   let widgetPollTimer: ReturnType<typeof setInterval> | undefined;
   const WIDGET_POLL_MS = 2_000;
-
-  /** Active-tool snapshot for the provider's native re-execution fallback. */
-  const isActiveTool = (name: string): boolean => {
-    try {
-      return pi.getActiveTools().includes(name);
-    } catch {
-      return false; // API unavailable (print/RPC edge) — stay on the wrapper.
-    }
-  };
 
   function setAgyTasksWidget(live: number): void {
     if (!tasksUi || live === widgetLiveCount) return;
@@ -522,9 +466,10 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         }
         const [tasks, artifacts] = await Promise.all([
           listAgyTasks(snapshot.conversationId, {
+            brainDir: AGY_BRAIN_DIR,
             sessionCwd: tasksSessionCwd,
           }),
-          listAgyArtifacts(snapshot.conversationId),
+          listAgyArtifacts(snapshot.conversationId, { brainDir: AGY_BRAIN_DIR }),
         ]);
         setAgyTasksWidget(
           tasks.filter((task) => task.pids.length > 0 || task.orphans.length > 0).length,
@@ -581,58 +526,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     }
   }
 
-  pi.registerTool({
-    name: WRAPPER_TOOL_NAME,
-    label: "antigravity",
-    description: WRAPPER_TOOL_DESCRIPTION,
-    parameters: Type.Object({
-      tool: Type.String(),
-      input: Type.Unknown(),
-    }),
-    async execute(toolCallId, params) {
-      const recorded = replay.take(toolCallId);
-      if (!recorded) {
-        throw new Error(`No recorded antigravity result for "${params.tool}".`);
-      }
-      if (recorded.error) {
-        throw new Error(recorded.error);
-      }
-      const body = recorded.output ?? "";
-      return {
-        content: [{ type: "text", text: body ? body.slice(0, 16_000) : "(no output)" }],
-        details: recorded,
-      };
-    },
-    renderCall(args, theme) {
-      return new Text(formatAgyCall(args.tool, args.input, theme), 0, 0);
-    },
-    renderResult(result, { expanded }, theme, context) {
-      const body = result.content[0]?.type === "text" ? result.content[0].text : "";
-      const details = result.details as RecordedAgyTool | undefined;
-      const tool = details?.agyTool ?? "tool";
-      if (context.isError) {
-        const message = body && body !== "(no output)" ? body.split("\n")[0] : "failed";
-        return new Text(theme.fg("error", `✗ ${agyToolLabel(tool)}: ${message}`), 0, 0);
-      }
-      const secs =
-        typeof details?.durationSeconds === "number"
-          ? theme.fg("muted", ` (${details.durationSeconds.toFixed(2)}s)`)
-          : "";
-      const { counts } = summarizeAgyResult(tool, details?.output);
-      const parts = [theme.fg("success", "✓ "), counts ? theme.fg("muted", counts) : "", secs];
-      let text = parts.join("");
-      if (body && body !== "(no output)") {
-        const lines = body.split("\n");
-        const shown = expanded ? lines : lines.slice(0, 3);
-        text += `\n${shown.map((line) => theme.fg("toolOutput", line)).join("\n")}`;
-        if (!expanded && lines.length > 3) {
-          text += theme.fg("muted", `\n… +${lines.length - 3} lines (ctrl+o to expand)`);
-        }
-      }
-      return new Text(text, 0, 0);
-    },
-  });
-
   const registerAntigravityProvider = (models: AgyModelInfo[]) => {
     pi.registerProvider("antigravity", {
       name: "Google Antigravity (agy)",
@@ -643,16 +536,33 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       streamSimple: streamAntigravity(
         runtime,
         service,
-        replay,
         bridge,
         updateAgyTasksWidget,
-        getBootstrapSuffix,
-        isActiveTool,
         handleAgyActivity,
         createAntigravityRuntime,
         (modelId) => currentCache.models.find((candidate) => candidate.id === modelId),
         readAgyProcessProfile,
         bridgeManager.processRevision,
+        () => {
+          if (!activeBroker || !bridgeManager.isRegistered() || !bridgeManager.isRunning()) {
+            throw new Error("antigravity: secure Pi bridge is unavailable; refusing to start agy.");
+          }
+          return {
+            geminiDir: SECURITY_PROFILE.geminiDir,
+            brokerCwd: activeBroker.cwd,
+            sandbox: {
+              required: true,
+              geminiDir: SECURITY_PROFILE.geminiDir,
+              brokerCwd: activeBroker.cwd,
+            },
+          };
+        },
+        async (event) => {
+          await appendAgySecurityEvent({
+            ...event,
+            ...(activePiSessionId ? { piSessionId: activePiSessionId } : {}),
+          });
+        },
       ),
     });
   };
@@ -693,23 +603,13 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     updateAgyTasksWidget();
   });
 
-  // The display-only `antigravity` wrapper tool only matters while an agy
-  // model is active (the provider synthesizes its toolCalls from recorded
-  // agy activity). Keep it out of every other model's tool payload: sync
-  // active-tool state whenever the selected model changes, including the
-  // session's initial restore.
-  const syncWrapperToolActivation = (provider: string | undefined) => {
-    const next = wrapperToolActiveAfterModelSwitch(
-      pi.getActiveTools(),
-      WRAPPER_TOOL_NAME,
-      provider,
-      "antigravity",
-    );
-    if (next) pi.setActiveTools([...next]);
-  };
-
   pi.on("session_start", async (event, ctx: ExtensionContext) => {
-    syncWrapperToolActivation(ctx.model?.provider);
+    activePiSessionId = ctx.sessionManager.getSessionId();
+    const nextBroker = sessionBroker(SECURITY_PROFILE, ctx.sessionManager.getSessionId());
+    if (activeBroker && activeBroker.sessionKey !== nextBroker.sessionKey) {
+      await teardownBridge();
+    }
+    activeBroker = nextBroker;
     selectedModelKey = ctx.model ? `${ctx.model.provider}:${ctx.model.id}` : undefined;
     const restored =
       event.reason !== "fork" && ctx.model?.provider === "antigravity"
@@ -722,7 +622,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     const compatibleRestore =
       restored &&
       restored.modelId === ctx.model?.id &&
-      (await agyConversationExists(restored.conversationId))
+      (await agyConversationExists(restored.conversationId, SECURITY_PROFILE.geminiDir))
         ? restored
         : undefined;
     await runAntigravity(
@@ -759,7 +659,6 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("model_select", async (event, ctx) => {
-    syncWrapperToolActivation(event.model?.provider);
     const nextModelKey = event.model ? `${event.model.provider}:${event.model.id}` : undefined;
     if (selectedModelKey?.startsWith("antigravity:") && selectedModelKey !== nextModelKey) {
       // Another provider/model can add context that the mutable agy
@@ -772,6 +671,12 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
     selectedModelKey = nextModelKey;
     // The bridge exists only while an Antigravity model is selected.
     if (event.model?.provider === "antigravity") {
+      // In non-interactive print mode Pi can emit the initial model_select
+      // before session_start has established the session broker. session_start
+      // performs the same registration after assigning activeBroker, so defer
+      // here instead of turning a harmless startup ordering difference into a
+      // fail-closed extension error.
+      if (!activeBroker) return;
       await ensureBridgeRegistered(ctx?.ui);
       await refreshStaleModelsWhenSelected();
     } else {
@@ -811,6 +716,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       const snapshot = await runAntigravity(runtime, service.snapshot);
       if (snapshot.conversationId) {
         const tasks = await listAgyTasks(snapshot.conversationId, {
+          brainDir: AGY_BRAIN_DIR,
           sessionCwd: tasksSessionCwd,
         });
         const live = tasks.filter((task) => task.pids.length > 0);
@@ -850,7 +756,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerCommand("agy", {
-    description: "Manage the agy backend: status | reset | models | agents | doctor",
+    description: "Manage the agy backend: status | reset | models | agents | doctor | unlock",
     handler: async (args, ctx) => {
       const sub = args.trim().toLowerCase();
       if (sub === "reset") {
@@ -886,9 +792,34 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         }
         return;
       }
+      if (sub === "unlock") {
+        try {
+          const result = await recoverStaleBridgeLock(SECURITY_PROFILE);
+          ctx.ui.notify(
+            result === "recovered"
+              ? "antigravity: stale bridge lock and global endpoint cleared."
+              : "antigravity: bridge profile is not locked.",
+            "info",
+          );
+        } catch (error) {
+          ctx.ui.notify(
+            `antigravity: lock recovery refused (${error instanceof Error ? error.message : String(error)}).`,
+            "error",
+          );
+        }
+        return;
+      }
       if (sub === "doctor") {
         const lines = ["antigravity doctor"];
-        const binary = await checkAgyBinary({ refresh: true });
+        await prepareAgySecurityProfile(SECURITY_PROFILE);
+        const binary = await checkAgyBinary({
+          refresh: true,
+          sandbox: {
+            required: true,
+            geminiDir: SECURITY_PROFILE.geminiDir,
+            brokerCwd: activeBroker?.cwd ?? SECURITY_PROFILE.brokerRoot,
+          },
+        });
         if (binary.ok) {
           lines.push(
             `binary: ${binary.binary} (${binary.version}, ${binary.source})`,
@@ -916,7 +847,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         }
 
         try {
-          const discovered = parseAgyModels((await runAgyCommand(["models"])).stdout);
+          const discovered = parseAgyModels(await execAgy(["models"]));
           if (discovered.length === 0) throw new Error("no valid model rows returned");
           currentCache = { fetchedAt: Date.now(), source: "live", models: discovered };
           registerAntigravityProvider(discovered);
@@ -981,8 +912,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         const conversationId = snapshot?.conversationId;
         if (conversationId) {
           const [exists, metadata] = await Promise.all([
-            agyConversationExists(conversationId),
-            readAgyConversationMetadata(conversationId),
+            agyConversationExists(conversationId, SECURITY_PROFILE.geminiDir),
+            readAgyConversationMetadata(conversationId, { file: AGY_METADATA_FILE }),
           ]);
           lines.push(
             `conversation: ${conversationId} · db ${exists ? "readable" : "missing/unreadable"}`,
@@ -996,14 +927,16 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
       }
       if (sub) {
         ctx.ui.notify(
-          `antigravity: unknown argument "${sub}". Use reset | models | agents | doctor.`,
+          `antigravity: unknown argument "${sub}". Use reset | models | agents | doctor | unlock.`,
           "error",
         );
         return;
       }
       const snapshot = await runAntigravity(runtime, service.snapshot);
       const id = snapshot.conversationId;
-      const metadata = id ? await readAgyConversationMetadata(id) : undefined;
+      const metadata = id
+        ? await readAgyConversationMetadata(id, { file: AGY_METADATA_FILE })
+        : undefined;
       const metadataTitle = metadata?.metadata?.title
         ? statusOneLine(metadata.metadata.title)
         : undefined;
@@ -1047,7 +980,8 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         ctx.ui.notify("agy-tasks: no agy conversation in this session yet.", "error");
         return;
       }
-      const rescan = () => listAgyTasks(conversationId, { sessionCwd: ctx.cwd });
+      const rescan = () =>
+        listAgyTasks(conversationId, { brainDir: AGY_BRAIN_DIR, sessionCwd: ctx.cwd });
 
       // No arguments: interactive dashboard overlay (x stops, r rescans).
       if (!arg) {
@@ -1092,7 +1026,7 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         ctx.ui.notify("agy-artifacts: no agy conversation in this session yet.", "error");
         return;
       }
-      const rescan = () => listAgyArtifacts(conversationId);
+      const rescan = () => listAgyArtifacts(conversationId, { brainDir: AGY_BRAIN_DIR });
       const arg = args.trim();
 
       // `open <name>`: non-interactive open by exact name or unique prefix.
@@ -1134,7 +1068,17 @@ export default function antigravityExtension(pi: ExtensionAPI): void {
         ctx.ui.notify('agy-usage: usage "/agy-usage".', "error");
         return;
       }
-      await openAgyUsagePicker(ctx, (signal) => fetchAgyUsage({ signal }));
+      await openAgyUsagePicker(ctx, (signal) =>
+        fetchAgyUsage({
+          signal,
+          geminiDir: SECURITY_PROFILE.geminiDir,
+          sandbox: {
+            required: true,
+            geminiDir: SECURITY_PROFILE.geminiDir,
+            brokerCwd: activeBroker?.cwd ?? SECURITY_PROFILE.brokerRoot,
+          },
+        }),
+      );
     },
   });
 }

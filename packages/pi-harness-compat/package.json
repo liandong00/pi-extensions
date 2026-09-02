@@ -1,0 +1,30 @@
+{
+  "name": "@liandong00/pi-harness-compat",
+  "version": "0.1.0",
+  "description": "Claude permission and Codex sandbox compatibility for the Pi coding agent.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "files": [
+    "index.ts",
+    "lib"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test --experimental-strip-types test/*.test.ts",
+    "check": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "toml": "^4.3.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

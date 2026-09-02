@@ -6,6 +6,7 @@ import path from "node:path";
 import { gte, prerelease, rcompare, valid } from "semver";
 import which from "which";
 import { killAgyTree, trackAgyChild, untrackAgyChild } from "./agy-children.ts";
+import { sandboxAgyLaunch, type AgySandboxOptions } from "./agy-sandbox.ts";
 
 export const MIN_AGY_VERSION = "1.1.22";
 export const AGY_VERSION_TIMEOUT_MS = 5_000;
@@ -86,6 +87,7 @@ export interface CheckAgyBinaryOptions {
   platform?: NodeJS.Platform;
   timeoutMs?: number;
   spawnOverride?: typeof spawn;
+  sandbox?: AgySandboxOptions;
   statOverride?: (file: string) => Promise<{ mtimeMs: number; ctimeMs?: number; size: number }>;
   whichOverride?: (
     command: string,
@@ -127,6 +129,9 @@ async function binaryCacheIdentity(
     env.PATHEXT ?? "",
     options.homeDir ?? os.homedir(),
     options.platform ?? process.platform,
+    options.sandbox?.required
+      ? `sandbox:${options.sandbox.geminiDir}:${options.sandbox.brokerCwd}`
+      : "sandbox:off",
     ...signatures.map(({ cache }) => cache),
   ].join("\0");
   return {
@@ -213,21 +218,28 @@ function classifySpawnError(error: SpawnLikeError): AgyBinaryFailureCategory {
   return "spawn-failed";
 }
 
-function checkCandidate(
+async function checkCandidate(
   candidate: BinaryCandidate,
   configured: string,
   options: CheckAgyBinaryOptions,
 ): Promise<AgyBinaryCheck> {
+  const sandbox = await sandboxAgyLaunch(
+    candidate.binary,
+    ["--version"],
+    options.sandbox,
+    options.env,
+  );
   return new Promise((resolve) => {
     const doSpawn = options.spawnOverride ?? spawn;
     let stdout = "";
     let stderr = "";
     let versionHint: ReturnType<typeof extractAgyVersion>;
     let settled = false;
-    const child = doSpawn(candidate.binary, ["--version"], {
+    const child = doSpawn(sandbox?.file ?? candidate.binary, sandbox?.args ?? ["--version"], {
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
       windowsHide: true,
+      env: sandbox?.env,
     });
     trackAgyChild(child);
 
@@ -452,6 +464,7 @@ export interface RunAgyCommandOptions {
   maxOutputBytes?: number;
   cwd?: string;
   spawnOverride?: typeof spawn;
+  sandbox?: AgySandboxOptions;
 }
 
 export interface AgyCommandResult {
@@ -465,23 +478,25 @@ export async function runAgyCommand(
   args: readonly string[],
   options: RunAgyCommandOptions = {},
 ): Promise<AgyCommandResult> {
-  const binary = options.binary ?? (await getAgyBinary());
+  const binary = options.binary ?? (await getAgyBinary({ sandbox: options.sandbox }));
   if (options.signal?.aborted) {
     const error = new Error("agy command was aborted.");
     error.name = "AbortError";
     throw error;
   }
+  const sandbox = await sandboxAgyLaunch(binary, args, options.sandbox);
   return new Promise((resolve, reject) => {
     const doSpawn = options.spawnOverride ?? spawn;
     const limit = options.maxOutputBytes ?? COMMAND_OUTPUT_LIMIT;
     let stdout = "";
     let stderr = "";
     let settled = false;
-    const child = doSpawn(binary, [...args], {
+    const child = doSpawn(sandbox?.file ?? binary, sandbox?.args ?? [...args], {
       cwd: options.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       detached: true,
       windowsHide: true,
+      env: sandbox?.env,
     });
     trackAgyChild(child);
 

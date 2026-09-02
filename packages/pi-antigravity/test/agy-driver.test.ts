@@ -73,6 +73,7 @@ test("buildDriverAgyArgs uses stream input and omits print deadlines", () => {
     model: "gemini-3.7-flash",
     effort: "high",
     cwd: "/repo",
+    geminiDir: "/secure-gemini",
     timeoutMs: 5,
     agent: "reviewer",
     mode: "plan",
@@ -84,6 +85,9 @@ test("buildDriverAgyArgs uses stream input and omits print deadlines", () => {
   assert.equal(args[args.indexOf("--effort") + 1], "high");
   assert.equal(args[args.indexOf("--agent") + 1], "reviewer");
   assert.equal(args[args.indexOf("--mode") + 1], "plan");
+  assert.equal(args[0], "--gemini_dir=/secure-gemini");
+  assert.ok(!args.includes("--dangerously-skip-permissions"));
+  assert.ok(!args.includes("--add-dir"));
   assert.ok(!args.includes("--print"));
   assert.ok(!args.includes("--print-timeout"));
   assert.ok(!args.includes("3:7"));
@@ -338,6 +342,7 @@ test("persistent driver identifies every process reuse mismatch", async () => {
   }> = [
     { cause: "binary", first: { binary: "/fake/agy-v1" }, second: { binary: "/fake/agy-v2" } },
     { cause: "cwd", second: { cwd: tmpdir() } },
+    { cause: "gemini-dir", second: { geminiDir: path.join(tmpdir(), "another-gemini") } },
     { cause: "model", first: { model: "model-a" }, second: { model: "model-b" } },
     { cause: "effort", first: { effort: "high" }, second: { effort: "low" } },
     { cause: "agent", first: { agent: "reviewer" }, second: { agent: "planner" } },

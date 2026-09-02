@@ -8,6 +8,7 @@ import {
 } from "./agy-client.ts";
 import { killAgyTree, signalAgyTree, trackAgyChild, untrackAgyChild } from "./agy-children.ts";
 import { AgyCompatibilityError, checkAgyBinary } from "./agy-diagnostics.ts";
+import { sandboxAgyLaunch } from "./agy-sandbox.ts";
 import { parseAgyLine } from "./events.ts";
 import { applyEvent, newTurnOutcome, type AgyTurnOutcome } from "./reducer.ts";
 
@@ -16,6 +17,8 @@ export type AgyExecutorCloseReason = "recycle" | "abort" | "shutdown";
 export type AgyRecycleCause =
   | "binary"
   | "cwd"
+  | "gemini-dir"
+  | "sandbox"
   | "model"
   | "effort"
   | "agent"
@@ -26,6 +29,7 @@ export type AgyRecycleCause =
   | "session-tree"
   | "restore"
   | "reset"
+  | "security-violation"
   | "unspecified";
 
 export interface AgyProcessConfigSnapshot {
@@ -33,6 +37,8 @@ export interface AgyProcessConfigSnapshot {
   binaryVersion?: string;
   binaryRevision?: string;
   cwd?: string;
+  geminiDir?: string;
+  sandboxRequired?: boolean;
   model?: string;
   effort?: string;
   agent?: string;
@@ -102,6 +108,8 @@ function processConfig(
     binaryVersion,
     binaryRevision,
     cwd: request.cwd,
+    geminiDir: request.geminiDir,
+    sandboxRequired: request.sandbox?.required,
     model: request.model,
     effort: request.effort,
     agent: request.agent,
@@ -124,6 +132,8 @@ function recycleCause(
   )
     return "binary";
   if (current.cwd !== next.cwd) return "cwd";
+  if (current.geminiDir !== next.geminiDir) return "gemini-dir";
+  if (current.sandboxRequired !== next.sandboxRequired) return "sandbox";
   if (current.model !== next.model) return "model";
   if (current.effort !== next.effort) return "effort";
   if (current.agent !== next.agent) return "agent";
@@ -234,7 +244,7 @@ export class AgyDriverSession implements AgyTurnExecutor {
   }
 
   async #runExclusive(request: AgyTurnRequest): Promise<AgyTurnOutcome> {
-    const checked = request.binary ? undefined : await checkAgyBinary();
+    const checked = request.binary ? undefined : await checkAgyBinary({ sandbox: request.sandbox });
     if (checked && !checked.ok) throw new AgyCompatibilityError(checked);
     const binary = request.binary ?? checked?.binary;
     if (!binary) throw new AgySpawnError("agy binary resolution returned no executable.", "");
@@ -284,32 +294,33 @@ export class AgyDriverSession implements AgyTurnExecutor {
     const doSpawn = request.spawnOverride ?? spawn;
     let child: DriverChild;
     try {
-      child = doSpawn(
-        config.binary,
-        buildDriverAgyArgs({
-          conversationId: request.conversationId,
-          model: request.model,
-          effort: request.effort,
-          cwd: request.cwd,
-          timeoutMs: request.timeoutMs,
-          inactivityTimeoutMs: request.inactivityTimeoutMs,
-          toolInactivityTimeoutMs: request.toolInactivityTimeoutMs,
-          signal: request.signal,
-          agent: request.agent,
-          mode: request.mode,
-          bridgeRevision: request.bridgeRevision,
-          binary: config.binary,
-          onActivity: request.onActivity,
-          onConversation: request.onConversation,
-          spawnOverride: request.spawnOverride,
-        }),
-        {
-          cwd: request.cwd,
-          stdio: ["pipe", "pipe", "pipe"],
-          detached: true,
-          windowsHide: true,
-        },
-      ) as DriverChild;
+      const args = buildDriverAgyArgs({
+        conversationId: request.conversationId,
+        model: request.model,
+        effort: request.effort,
+        cwd: request.cwd,
+        geminiDir: request.geminiDir,
+        sandbox: request.sandbox,
+        timeoutMs: request.timeoutMs,
+        inactivityTimeoutMs: request.inactivityTimeoutMs,
+        toolInactivityTimeoutMs: request.toolInactivityTimeoutMs,
+        signal: request.signal,
+        agent: request.agent,
+        mode: request.mode,
+        bridgeRevision: request.bridgeRevision,
+        binary: config.binary,
+        onActivity: request.onActivity,
+        onConversation: request.onConversation,
+        spawnOverride: request.spawnOverride,
+      });
+      const sandbox = await sandboxAgyLaunch(config.binary, args, request.sandbox);
+      child = doSpawn(sandbox?.file ?? config.binary, sandbox?.args ?? args, {
+        cwd: request.cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
+        windowsHide: true,
+        env: sandbox?.env,
+      }) as DriverChild;
     } catch (error) {
       this.#state = "dead";
       this.#config = undefined;

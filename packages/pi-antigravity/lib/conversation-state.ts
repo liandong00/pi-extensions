@@ -30,23 +30,17 @@ export type PersistedAgyState = PersistedAgyConversation | PersistedAgyReset;
 
 export function agyConversationDatabasePath(
   conversationId: string,
-  homeDirectory = os.homedir(),
+  geminiDirectory = path.join(os.homedir(), ".gemini"),
 ): string {
-  return path.join(
-    homeDirectory,
-    ".gemini",
-    "antigravity-cli",
-    "conversations",
-    `${conversationId}.db`,
-  );
+  return path.join(geminiDirectory, "antigravity-cli", "conversations", `${conversationId}.db`);
 }
 
 export async function agyConversationExists(
   conversationId: string,
-  homeDirectory?: string,
+  geminiDirectory?: string,
 ): Promise<boolean> {
   try {
-    await fs.access(agyConversationDatabasePath(conversationId, homeDirectory), fsConstants.R_OK);
+    await fs.access(agyConversationDatabasePath(conversationId, geminiDirectory), fsConstants.R_OK);
     return true;
   } catch {
     return false;

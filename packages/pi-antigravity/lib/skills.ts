@@ -2,24 +2,16 @@
  * Skill passing for agy — Phase 2 of the pi-tool & skill bridge.
  *
  * agy's native skill expansion is disabled by our always-on
- * `--disable-slash-commands`, so pi skills reach agy two ways:
- *   - bridge mode: one `activate_skill` MCP tool (session-prefixed) whose
- *     JSON-schema enum is the catalog and whose description carries each
- *     skill's one-liner — pi's progressive disclosure, so agy can tell when a
- *     skill applies. Calling it returns the full SKILL.md. Nothing is appended
- *     to the user prompt: tools/list is refreshed on every agy spawn,
- *     including after pi compaction.
- *   - direct mode (bridge off, or a bridge that failed to register): a compact
- *     catalog of absolute SKILL.md paths is appended on the first turn of a
- *     fresh agy conversation, and headless agy reads them straight from disk
- *     (verified 2026-08-21).
+ * `--disable-slash-commands`. Pi skills reach agy only through one
+ * `activate_skill` MCP tool whose JSON-schema enum is the catalog and whose
+ * description carries each skill's one-liner. Calling it returns the bounded,
+ * path-checked SKILL.md. Nothing is appended to the user prompt.
  *
  * Catalogs stay name + one-liner only — oversized catalogs derail headless
  * turns the same way agy's built-in antigravity_guide skill does.
  */
 
-import { readdir, readFile } from "node:fs/promises";
-import os from "node:os";
+import { lstat, readdir, readFile, realpath } from "node:fs/promises";
 import path from "node:path";
 
 /** Minimal shape of pi's loaded skills (from systemPromptOptions.skills). */
@@ -32,43 +24,19 @@ export interface SkillLite {
   baseDir: string;
 }
 
-/** MCP tool name (without the session `pi__p<pid>__` prefix). */
+/** MCP tool name without the stable `pi__` prefix. */
 export const ACTIVATE_SKILL_TOOL_NAME = "activate_skill";
 
 const MAX_DESCRIPTION = 120;
 const MAX_RESOURCES = 20;
+const MAX_SKILL_BYTES = 2 * 1024 * 1024;
 
-/**
- * Skills agy cannot discover on its own.
- *
- * agy natively scans `<workspace>/.agents/skills/` (walking up from its cwd
- * to the repo root) and injects those skills' names/descriptions itself —
- * verified 2026-08-21, even under `--disable-slash-commands`. Injecting
- * those again would duplicate agy's own catalog, so the bridged catalog
- * only includes skills OUTSIDE the session workspace (pi-only globals like
- * `~/.pi/agent/skills` and `~/.agents/skills`, which agy never scans).
- */
-export function nonWorkspaceSkills(
-  skills: SkillLite[],
-  sessionCwd: string | undefined,
-): SkillLite[] {
-  if (!sessionCwd) return skills;
-  const resolvedCwd = path.resolve(sessionCwd);
-  const cwdPrefix = resolvedCwd.endsWith(path.sep) ? resolvedCwd : resolvedCwd + path.sep;
-  const home = path.resolve(os.homedir());
-  return skills.filter((skill) => {
-    const filePath = path.resolve(skill.filePath);
-    if (filePath.startsWith(cwdPrefix)) return false;
-    const marker = `${path.sep}.agents${path.sep}skills${path.sep}`;
-    const markerIndex = filePath.indexOf(marker);
-    if (markerIndex < 0) return true;
-    const skillWorkspace = filePath.slice(0, markerIndex) || path.parse(filePath).root;
-    if (path.resolve(skillWorkspace) === home) return true; // ~/.agents/skills is global.
-    return !(
-      resolvedCwd === path.resolve(skillWorkspace) ||
-      resolvedCwd.startsWith(`${path.resolve(skillWorkspace)}${path.sep}`)
-    );
-  });
+function contained(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return (
+    relative === "" ||
+    (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative))
+  );
 }
 
 /** Unique skills with a file path; first name wins (same as pi collisions). */
@@ -143,29 +111,6 @@ export async function handleActivateSkill(
 }
 
 /**
- * Direct-mode bootstrap catalog (bridge off or unavailable). Returns undefined
- * when there are no model-invocable skills, so nothing is injected.
- */
-export function formatSkillCatalog(skills: SkillLite[]): string | undefined {
-  const usable = usableSkillCatalog(skills);
-  if (usable.length === 0) return undefined;
-  const lines = usable.map((skill) => {
-    const description =
-      skill.description.replace(/\s+/g, " ").trim().slice(0, MAX_DESCRIPTION) || "(no description)";
-    return `- ${skill.name}: ${description} (${skill.filePath})`;
-  });
-  return [
-    "## pi Agent Skills",
-    "",
-    "The following pi Agent Skills are available in this session:",
-    ...lines,
-    "",
-    "To activate a skill, read its SKILL.md file directly.",
-    "Activate a skill BEFORE attempting its workflow; follow the activated instructions.",
-  ].join("\n");
-}
-
-/**
  * Load a skill bundle for agy: the full SKILL.md plus the absolute paths of
  * bundled resources (relative references in SKILL.md are useless to agy —
  * they resolve against the skill directory, not the agy workspace).
@@ -175,8 +120,23 @@ export async function readSkillBundle(skill: SkillLite): Promise<{
   isError: boolean;
 }> {
   let body: string;
+  let canonicalBase: string;
   try {
-    body = await readFile(skill.filePath, "utf-8");
+    const [base, file, fileStat] = await Promise.all([
+      realpath(skill.baseDir),
+      realpath(skill.filePath),
+      lstat(skill.filePath),
+    ]);
+    if (
+      !fileStat.isFile() ||
+      fileStat.isSymbolicLink() ||
+      fileStat.size > MAX_SKILL_BYTES ||
+      !contained(base, file)
+    ) {
+      throw new Error("SKILL.md is unsafe, oversized, or outside its declared skill directory");
+    }
+    canonicalBase = base;
+    body = await readFile(file, "utf-8");
   } catch (error) {
     return {
       content: `antigravity: failed to read skill "${skill.name}" (${error instanceof Error ? error.message : error}).`,
@@ -185,14 +145,14 @@ export async function readSkillBundle(skill: SkillLite): Promise<{
   }
   const resources: string[] = [];
   try {
-    const entries = await readdir(skill.baseDir, { withFileTypes: true });
+    const entries = await readdir(canonicalBase, { withFileTypes: true });
     for (const entry of entries) {
       if (resources.length >= MAX_RESOURCES) {
         resources.push(`… (+${entries.length - MAX_RESOURCES} more entries)`);
         break;
       }
       if (entry.name === "SKILL.md") continue;
-      resources.push(path.join(skill.baseDir, entry.name) + (entry.isDirectory() ? "/" : ""));
+      resources.push(path.join(canonicalBase, entry.name) + (entry.isDirectory() ? "/" : ""));
     }
   } catch {
     // Resource listing is best-effort; the SKILL.md body is the payload.

@@ -1,5 +1,7 @@
 # Plan: improve `pi-antigravity` from the Antigravity VS Code extension
 
+> Historical upstream plan. Security-sensitive argv and native-tool sections below are superseded in this fork by `lib/security-profile.ts`, `lib/agy-sandbox.ts`, and the current README. In particular, `--dangerously-skip-permissions`, `--add-dir`, native tool execution, and global agy MCP registration are no longer valid implementation instructions.
+
 ## Status and implementation baseline
 
 This reviewed plan is **implemented on branch

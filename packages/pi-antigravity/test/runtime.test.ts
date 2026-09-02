@@ -122,25 +122,27 @@ test("runtime restores the selected pi branch only when starting a fresh convers
       runtime,
       service.beginStreamTurn({
         prompt: "current request",
+        bootstrapPrefix: "PI SYSTEM",
         historyBootstrap: "RESTORED PI BRANCH",
-        bootstrapSuffix: "SKILL CATALOG",
         modelId: "gemini-3.7-flash",
+        processCwd: "/broker",
+        geminiDir: "/secure-gemini",
       }),
     );
     assert.equal(await first.next(), null);
-    assert.equal(requests[0].prompt, "RESTORED PI BRANCH\n\ncurrent request\n\nSKILL CATALOG");
+    assert.equal(requests[0].prompt, "PI SYSTEM\n\nRESTORED PI BRANCH\n\ncurrent request");
     assert.equal(requests[0].conversationId, undefined);
     assert.equal(requests[0].effort, undefined);
+    assert.equal(requests[0].cwd, "/broker");
+    assert.equal(requests[0].geminiDir, "/secure-gemini");
 
     await runAntigravity(runtime, service.finishTurn);
     const second = await runAntigravity(
       runtime,
       service.beginStreamTurn({
         prompt: "follow-up",
+        bootstrapPrefix: "MUST NOT BE REPEATED",
         historyBootstrap: "MUST NOT BE REPEATED",
-        // Direct-mode extras still come from the provider every request; the
-        // runtime must keep them off conversation resumes.
-        bootstrapSuffix: "SKILL CATALOG",
         modelId: "gemini-3.7-flash",
         effort: "medium",
       }),
@@ -154,18 +156,15 @@ test("runtime restores the selected pi branch only when starting a fresh convers
       runtime,
       service.beginStreamTurn({
         prompt: "after model switch",
+        bootstrapPrefix: "PI SYSTEM",
         historyBootstrap: "RESTORED AFTER SWITCH",
-        bootstrapSuffix: "SKILL CATALOG",
         modelId: "claude-sonnet-4-6",
         effort: "high",
       }),
     );
     assert.equal(await switched.next(), null);
-    // Model switch starts a fresh conversation — extras ride again.
-    assert.equal(
-      requests[2].prompt,
-      "RESTORED AFTER SWITCH\n\nafter model switch\n\nSKILL CATALOG",
-    );
+    // Model switch starts a fresh conversation and restores Pi context.
+    assert.equal(requests[2].prompt, "PI SYSTEM\n\nRESTORED AFTER SWITCH\n\nafter model switch");
     assert.equal(requests[2].conversationId, undefined);
   } finally {
     await runtime.dispose();
@@ -285,7 +284,6 @@ test("runtime falls back to bounded Pi history when a persisted conversation dis
       service.beginStreamTurn({
         prompt: "continue",
         historyBootstrap: "PI FALLBACK HISTORY",
-        bootstrapSuffix: "SKILL CATALOG",
         modelId: "gemini-3.7-flash",
       }),
     );
@@ -293,7 +291,7 @@ test("runtime falls back to bounded Pi history when a persisted conversation dis
     assert.equal(await controller.next(), null);
     assert.equal(requests[0].conversationId, "persisted-conversation");
     assert.equal(requests[1].conversationId, undefined);
-    assert.equal(requests[1].prompt, "PI FALLBACK HISTORY\n\ncontinue\n\nSKILL CATALOG");
+    assert.equal(requests[1].prompt, "PI FALLBACK HISTORY\n\ncontinue");
   } finally {
     await runtime.dispose();
   }
@@ -387,6 +385,42 @@ test("runtime reset aborts the active process and clears conversation state", as
       conversationUsage: {},
       executor: { mode: "one-shot", state: "idle", lifecycle: [] },
     });
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("runtime security violation aborts the executor and makes the conversation unrestorable", async () => {
+  const closes: string[] = [];
+  let resolveRun: ((outcome: AgyTurnOutcome) => void) | undefined;
+  const executor: AgyTurnExecutor = {
+    run: async (request) => {
+      request.onConversation?.("unsafe-conversation");
+      return new Promise<AgyTurnOutcome>((resolve) => {
+        resolveRun = resolve;
+      });
+    },
+    snapshot: () => ({ mode: "persistent", state: "running", lifecycle: [] }),
+    close: async (reason, cause) => {
+      closes.push(`${reason}:${cause ?? "none"}`);
+      resolveRun?.({ ...completedOutcome("unsafe-conversation"), status: "ERROR" });
+    },
+  };
+  const runtime = createAntigravityRuntime(executor);
+  const service = runtime.runSync(AntigravityRuntime);
+  try {
+    await runAntigravity(runtime, service.setSession("/repo", undefined));
+    closes.length = 0;
+    await runAntigravity(
+      runtime,
+      service.beginStreamTurn({ prompt: "unsafe", modelId: "gemini-3.7-flash" }),
+    );
+    await runAntigravity(runtime, service.abortSecurityViolation);
+    assert.deepEqual(closes, ["abort:security-violation"]);
+    const snapshot = await runAntigravity(runtime, service.snapshot);
+    assert.equal(snapshot.conversationId, undefined);
+    assert.equal(snapshot.turns, 0);
+    assert.deepEqual(snapshot.conversationUsage, {});
   } finally {
     await runtime.dispose();
   }
@@ -551,131 +585,6 @@ test("runtime stall retry preserves original prompt on pre-init stall without co
     // not a continuation-only prompt on a blank conversation.
     assert.equal(requests[1]?.prompt, "original task");
     assert.equal(requests[1]?.conversationId, undefined);
-  } finally {
-    await runtime.dispose();
-  }
-});
-
-test("runtime injects bootstrapSuffix when direct skill fallback occurs mid-conversation", async () => {
-  const requests: AgyTurnRequest[] = [];
-  const runtime = createAntigravityRuntime(async (request) => {
-    requests.push(request);
-    const conversationId = "conv-mid-fallback";
-    request.onConversation?.(conversationId);
-    return completedOutcome(conversationId);
-  });
-  const service = runtime.runSync(AntigravityRuntime);
-  try {
-    await runAntigravity(runtime, service.setSession("/repo", undefined, true));
-    // Turn 1: Bridge was active, so bootstrapSuffix is undefined.
-    const turn1 = await runAntigravity(
-      runtime,
-      service.beginStreamTurn({
-        prompt: "turn 1 with bridge",
-        bootstrapSuffix: undefined,
-        modelId: "gemini-3.7-flash",
-      }),
-    );
-    assert.equal(await turn1.next(), null);
-    assert.equal(requests[0].prompt, "turn 1 with bridge");
-    assert.equal(requests[0].conversationId, undefined);
-
-    await runAntigravity(runtime, service.finishTurn);
-
-    // Turn 2: Bridge re-registration fails; direct-skill fallback provides bootstrapSuffix.
-    const turn2 = await runAntigravity(
-      runtime,
-      service.beginStreamTurn({
-        prompt: "turn 2 with direct skills",
-        bootstrapSuffix: "SKILL CATALOG FALLBACK",
-        modelId: "gemini-3.7-flash",
-      }),
-    );
-    assert.equal(await turn2.next(), null);
-    // Even though conversationId already exists, the suffix must be injected
-    // because this conversation never received direct skills before.
-    assert.equal(requests[1].prompt, "turn 2 with direct skills\n\nSKILL CATALOG FALLBACK");
-    assert.equal(requests[1].conversationId, "conv-mid-fallback");
-
-    await runAntigravity(runtime, service.finishTurn);
-
-    // Turn 3: Suffix was already bootstrapped into this conversation; not repeated.
-    const turn3 = await runAntigravity(
-      runtime,
-      service.beginStreamTurn({
-        prompt: "turn 3 unchanged skills",
-        bootstrapSuffix: "SKILL CATALOG FALLBACK",
-        modelId: "gemini-3.7-flash",
-      }),
-    );
-    assert.equal(await turn3.next(), null);
-    assert.equal(requests[2].prompt, "turn 3 unchanged skills");
-    assert.equal(requests[2].conversationId, "conv-mid-fallback");
-  } finally {
-    await runtime.dispose();
-  }
-});
-
-test("runtime preserves bootstrapSuffix when first attempt fails non-stall before conversation init", async () => {
-  const requests: AgyTurnRequest[] = [];
-  let call = 0;
-  const runtime = createAntigravityRuntime(async (request) => {
-    requests.push(request);
-    call++;
-    if (call === 1) {
-      // First attempt fails immediately (e.g. auth error, binary not found) before init
-      throw new Error("failed to start agy: binary not found");
-    }
-    const conversationId = "conv-after-auth-fix";
-    request.onConversation?.(conversationId);
-    return completedOutcome(conversationId);
-  });
-  const service = runtime.runSync(AntigravityRuntime);
-  try {
-    await runAntigravity(runtime, service.setSession("/repo", undefined, true));
-
-    // Turn 1: Fails with non-stall error
-    const turn1 = await runAntigravity(
-      runtime,
-      service.beginStreamTurn({
-        prompt: "first prompt",
-        bootstrapSuffix: "SKILL CATALOG",
-        modelId: "gemini-3.7-flash",
-      }),
-    );
-    await assert.rejects(() => turn1.next(), /binary not found/);
-    assert.equal(requests[0].prompt, "first prompt\n\nSKILL CATALOG");
-
-    await runAntigravity(runtime, service.finishTurn);
-
-    // Turn 2: User retries after fixing environment; skills must NOT be lost!
-    const turn2 = await runAntigravity(
-      runtime,
-      service.beginStreamTurn({
-        prompt: "retry prompt",
-        bootstrapSuffix: "SKILL CATALOG",
-        modelId: "gemini-3.7-flash",
-      }),
-    );
-    assert.equal(await turn2.next(), null);
-    // Crucial: bootstrapSuffix is STILL included because turn 1 failed before conversation init
-    assert.equal(requests[1].prompt, "retry prompt\n\nSKILL CATALOG");
-    assert.equal(requests[1].conversationId, undefined);
-
-    await runAntigravity(runtime, service.finishTurn);
-
-    // Turn 3: Conversation is now established and received skills; suffix is now suppressed
-    const turn3 = await runAntigravity(
-      runtime,
-      service.beginStreamTurn({
-        prompt: "follow up",
-        bootstrapSuffix: "SKILL CATALOG",
-        modelId: "gemini-3.7-flash",
-      }),
-    );
-    assert.equal(await turn3.next(), null);
-    assert.equal(requests[2].prompt, "follow up");
-    assert.equal(requests[2].conversationId, "conv-after-auth-fix");
   } finally {
     await runtime.dispose();
   }

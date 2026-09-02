@@ -1,5 +1,4 @@
 import type { AgyPiBridge } from "./bridge.ts";
-import { formatSkillCatalog, type SkillLite } from "./skills.ts";
 
 export interface BridgeLifecycleDeps {
   bridge: AgyPiBridge;
@@ -19,7 +18,6 @@ export interface BridgeLifecycleManager {
   readonly teardown: () => Promise<void>;
   readonly registrationGeneration: () => number;
   readonly processRevision: () => string;
-  readonly getBootstrapSuffix: (skills: SkillLite[]) => string | undefined;
 }
 
 export function createBridgeLifecycleManager(deps: BridgeLifecycleDeps): BridgeLifecycleManager {
@@ -37,12 +35,14 @@ export function createBridgeLifecycleManager(deps: BridgeLifecycleDeps): BridgeL
       if (!enabled) return false;
       if (registered) return true;
 
+      let startedHere = false;
       try {
         if (deps.pruneStaleRegistrations) {
           await deps.pruneStaleRegistrations();
         }
         if (!deps.bridge.running) {
           await deps.bridge.start();
+          startedHere = true;
         }
         const url = deps.bridge.url;
         if (!url) throw new Error("pi-tool bridge did not expose a URL after start.");
@@ -53,6 +53,9 @@ export function createBridgeLifecycleManager(deps: BridgeLifecycleDeps): BridgeL
         return true;
       } catch (error) {
         registered = false;
+        if (startedHere && deps.bridge.running) {
+          await deps.bridge.close().catch(() => {});
+        }
         const message = error instanceof Error ? error.message : String(error);
         const warning = `antigravity: pi-tool bridge unavailable (${message}).`;
         if (notify) {
@@ -83,8 +86,5 @@ export function createBridgeLifecycleManager(deps: BridgeLifecycleDeps): BridgeL
       }
       if (changed) generation += 1;
     },
-
-    getBootstrapSuffix: (skills: SkillLite[]) =>
-      enabled && registered ? undefined : formatSkillCatalog(skills),
   };
 }

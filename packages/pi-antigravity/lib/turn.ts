@@ -1,11 +1,11 @@
 /**
  * AgyTurnController — one agy turn shared across sequential pi requests.
  *
- * The provider ends its assistant message at each completed agy tool step
- * (stopReason "toolUse") so pi can render native tool cards and execute the
- * display-only replay wrapper. pi then re-invokes the provider, which
+ * The provider ends its assistant message at each completed Pi bridge call
+ * (stopReason "toolUse") so Pi can execute the real tool through its normal
+ * hooks and permission checks. Pi then re-invokes the provider, which
  * re-attaches to the same controller and keeps consuming buffered events
- * while the agy process continues running underneath.
+ * while agy waits for the MCP result.
  */
 
 import type { AgyActivity, AgyUsage } from "./reducer.ts";

@@ -84,11 +84,12 @@ test("newest reset marker prevents resurrecting an older conversation", () => {
 test("agyConversationExists checks the native conversation database", async (t) => {
   const home = await mkdtemp(join(tmpdir(), "pi-antigravity-state-"));
   t.after(() => rm(home, { recursive: true, force: true }));
-  const database = agyConversationDatabasePath("conversation-1", home);
-  await mkdir(join(home, ".gemini", "antigravity-cli", "conversations"), { recursive: true });
-  assert.equal(await agyConversationExists("conversation-1", home), false);
+  const geminiDirectory = join(home, ".gemini");
+  const database = agyConversationDatabasePath("conversation-1", geminiDirectory);
+  await mkdir(join(geminiDirectory, "antigravity-cli", "conversations"), { recursive: true });
+  assert.equal(await agyConversationExists("conversation-1", geminiDirectory), false);
   await writeFile(database, "sqlite");
-  assert.equal(await agyConversationExists("conversation-1", home), true);
+  assert.equal(await agyConversationExists("conversation-1", geminiDirectory), true);
 });
 
 test("persisted state parser rejects malformed or negative accounting data", () => {

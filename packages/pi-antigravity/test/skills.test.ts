@@ -1,16 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   ACTIVATE_SKILL_TOOL_NAME,
   activateSkillDescription,
   activateSkillParameters,
   findSkillByName,
-  formatSkillCatalog,
   handleActivateSkill,
-  nonWorkspaceSkills,
   readSkillBundle,
   usableSkillCatalog,
   type SkillLite,
@@ -72,25 +70,6 @@ test("usableSkillCatalog skips empty paths and keeps the first name", () => {
   assert.equal(findSkillByName([SKILL, dup], " grilling "), SKILL);
 });
 
-test("formatSkillCatalog lists name, one-liner, and path for direct reads", () => {
-  const block = formatSkillCatalog([SKILL]);
-  assert.ok(block);
-  assert.ok(block.includes("## pi Agent Skills"));
-  assert.ok(block.includes("- grilling: Interview the user relentlessly"));
-  assert.ok(block.includes("/skills/grilling/SKILL.md"));
-  assert.ok(block.includes("read its SKILL.md file directly"));
-  assert.ok(!block.includes("pi__skill__"));
-  assert.ok(!block.includes("activate_skill"));
-});
-
-test("formatSkillCatalog truncates long descriptions and returns undefined when empty", () => {
-  const long: SkillLite = { ...SKILL, description: "x".repeat(500) };
-  const block = formatSkillCatalog([long]);
-  assert.ok(block);
-  assert.ok(block.length < 700);
-  assert.equal(formatSkillCatalog([]), undefined);
-});
-
 test("handleActivateSkill returns the bundle or lists available names", async () => {
   const dir = await mkdtemp(path.join(tmpdir(), "agy-skill-activate-"));
   try {
@@ -130,9 +109,10 @@ test("readSkillBundle returns SKILL.md body and absolute resource paths", async 
       baseDir: dir,
     });
     assert.equal(bundle.isError, false);
+    const canonicalDir = await realpath(dir);
     assert.ok(bundle.content.includes("Do the thing."));
-    assert.ok(bundle.content.includes(`- ${path.join(dir, "docs")}/`));
-    assert.ok(bundle.content.includes(`- ${path.join(dir, "helper.sh")}`));
+    assert.ok(bundle.content.includes(`- ${path.join(canonicalDir, "docs")}/`));
+    assert.ok(bundle.content.includes(`- ${path.join(canonicalDir, "helper.sh")}`));
     assert.ok(!bundle.content.includes("SKILL.md\n- "));
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -169,31 +149,23 @@ test("readSkillBundle returns the complete SKILL.md instructions", async () => {
   }
 });
 
-test("nonWorkspaceSkills drops skills inside the session cwd, keeps globals", () => {
-  const project: SkillLite = { ...SKILL, filePath: "/repo/.agents/skills/proj/SKILL.md" };
-  const ancestorProject: SkillLite = {
-    ...SKILL,
-    name: "ancestor",
-    filePath: "/repo/.agents/skills/ancestor/SKILL.md",
-  };
-  const global: SkillLite = {
-    ...SKILL,
-    name: "herdr",
-    filePath: "/Users/x/.pi/agent/skills/herdr/SKILL.md",
-  };
-  const homeGlobal: SkillLite = {
-    ...SKILL,
-    name: "home-global",
-    filePath: path.join(homedir(), ".agents/skills/home-global/SKILL.md"),
-  };
-  const filtered = nonWorkspaceSkills(
-    [project, ancestorProject, global, homeGlobal],
-    "/repo/packages/child",
-  );
-  assert.deepEqual(
-    filtered.map((skill) => skill.name),
-    ["herdr", "home-global"],
-  );
-  // No session cwd (pre-session_start) → keep everything.
-  assert.equal(nonWorkspaceSkills([project], undefined).length, 1);
+test("readSkillBundle rejects a SKILL.md symlink outside the declared skill directory", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "agy-skill-link-"));
+  try {
+    const skillDir = path.join(root, "skill");
+    const outside = path.join(root, "outside.txt");
+    await mkdir(skillDir);
+    await writeFile(outside, "must not leak");
+    await symlink(outside, path.join(skillDir, "SKILL.md"));
+    const bundle = await readSkillBundle({
+      name: "unsafe",
+      description: "",
+      filePath: path.join(skillDir, "SKILL.md"),
+      baseDir: skillDir,
+    });
+    assert.equal(bundle.isError, true);
+    assert.ok(!bundle.content.includes("must not leak"));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });

@@ -80,8 +80,9 @@ function fakeExec(
 }
 
 test("buildAgyUsageArgs expands /usage in print mode without disabling slash commands", () => {
-  const args = buildAgyUsageArgs(30_000);
+  const args = buildAgyUsageArgs(30_000, "/secure-gemini");
   assert.deepEqual(args, [
+    "--gemini_dir=/secure-gemini",
     "--print",
     "/usage",
     "--output-format",
@@ -192,6 +193,7 @@ test("fetchAgyUsage parses stdout from the injected exec", async () => {
   const captured: { file: string; args: readonly string[] } = { file: "", args: [] };
   const report = await fetchAgyUsage({
     binary: "agy-test",
+    geminiDir: "/secure-gemini",
     execFileOverride: fakeExec((file, args, cb) => {
       captured.file = file;
       captured.args = args;
@@ -199,7 +201,8 @@ test("fetchAgyUsage parses stdout from the injected exec", async () => {
     }),
   });
   assert.equal(captured.file, "agy-test");
-  assert.equal(captured.args[1], "/usage");
+  assert.equal(captured.args[0], "--gemini_dir=/secure-gemini");
+  assert.equal(captured.args[2], "/usage");
   assert.ok(!captured.args.includes("--disable-slash-commands"));
   assert.equal(report.groups.length, 2);
 });

@@ -9,6 +9,7 @@
 import { spawn } from "node:child_process";
 import { killAgyTree, trackAgyChild, untrackAgyChild } from "./agy-children.ts";
 import { getAgyBinary } from "./agy-diagnostics.ts";
+import { sandboxAgyLaunch, type AgySandboxOptions } from "./agy-sandbox.ts";
 
 export const USAGE_TIMEOUT_MS = 30_000;
 
@@ -34,13 +35,22 @@ export interface AgyUsageReport {
 
 export interface FetchAgyUsageOptions {
   binary?: string;
+  geminiDir?: string;
+  sandbox?: AgySandboxOptions;
   timeoutMs?: number;
   signal?: AbortSignal;
   /** Test seam: replaces `execFile`. */
   execFileOverride?: (
     file: string,
     args: readonly string[],
-    options: { timeout?: number; signal?: AbortSignal; encoding?: string; maxBuffer?: number },
+    options: {
+      timeout?: number;
+      signal?: AbortSignal;
+      encoding?: string;
+      maxBuffer?: number;
+      cwd?: string;
+      env?: NodeJS.ProcessEnv;
+    },
     callback: (error: Error | null, stdout: string, stderr: string) => void,
   ) => unknown;
 }
@@ -193,17 +203,26 @@ export function formatAgyUsageReport(report: AgyUsageReport, now: Date = new Dat
     .join("\n\n");
 }
 
-export function buildAgyUsageArgs(timeoutMs = USAGE_TIMEOUT_MS): string[] {
+export function buildAgyUsageArgs(timeoutMs = USAGE_TIMEOUT_MS, geminiDir?: string): string[] {
   const timeout = Math.max(1, Math.ceil(timeoutMs / 1000));
   // Slash expansion is the whole point: do NOT pass --disable-slash-commands.
   // --print consumes the next token as the prompt, so /usage must follow it.
-  return ["--print", "/usage", "--output-format", "json", "--print-timeout", `${timeout}s`];
+  const args = ["--print", "/usage", "--output-format", "json", "--print-timeout", `${timeout}s`];
+  if (geminiDir) args.unshift(`--gemini_dir=${geminiDir}`);
+  return args;
 }
 
 function defaultExec(
   file: string,
   args: readonly string[],
-  options: { timeout?: number; signal?: AbortSignal; encoding?: string; maxBuffer?: number },
+  options: {
+    timeout?: number;
+    signal?: AbortSignal;
+    encoding?: string;
+    maxBuffer?: number;
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+  },
   callback: (error: Error | null, stdout: string, stderr: string) => void,
 ): void {
   let settled = false;
@@ -224,6 +243,8 @@ function defaultExec(
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
     signal: options.signal,
+    cwd: options.cwd,
+    env: options.env,
   });
   trackAgyChild(child);
   child.stdout?.setEncoding("utf8");
@@ -277,14 +298,27 @@ function defaultExec(
 
 /** Run `agy --print /usage` and parse the structured quota payload. */
 export async function fetchAgyUsage(options: FetchAgyUsageOptions = {}): Promise<AgyUsageReport> {
-  const binary = options.binary ?? (options.execFileOverride ? "agy" : await getAgyBinary());
+  const binary =
+    options.binary ??
+    (options.execFileOverride ? "agy" : await getAgyBinary({ sandbox: options.sandbox }));
   const timeoutMs = options.timeoutMs ?? USAGE_TIMEOUT_MS;
   const run = options.execFileOverride ?? defaultExec;
+  const args = buildAgyUsageArgs(timeoutMs, options.geminiDir);
+  const sandbox = options.execFileOverride
+    ? undefined
+    : await sandboxAgyLaunch(binary, args, options.sandbox);
   return new Promise((resolve, reject) => {
     run(
-      binary,
-      buildAgyUsageArgs(timeoutMs),
-      { timeout: timeoutMs, signal: options.signal, encoding: "utf8", maxBuffer: 1024 * 1024 },
+      sandbox?.file ?? binary,
+      sandbox?.args ?? args,
+      {
+        timeout: timeoutMs,
+        signal: options.signal,
+        encoding: "utf8",
+        maxBuffer: 1024 * 1024,
+        cwd: options.sandbox?.brokerCwd,
+        env: sandbox?.env,
+      },
       (error, stdout, stderr) => {
         if (error) {
           if (options.signal?.aborted || error.name === "AbortError") {

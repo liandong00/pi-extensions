@@ -3,15 +3,16 @@
  * The default persistent implementation lives in agy-driver.ts; both paths
  * parse NDJSON into the same AgyTurnOutcome contract.
  *
- * Every invocation hard-codes --dangerously-skip-permissions: headless agy
- * turns auto-deny any tool that needs a permission prompt, so skipping is
- * required for agy's own tools (run_command, file edits, browser) to work.
+ * Every invocation runs against a provider-owned Gemini directory. Native
+ * agy tools are denied there; all real work must return through the Pi bridge.
  */
 
 import { spawn } from "node:child_process";
+import path from "node:path";
 import { killAgyTree, trackAgyChild, untrackAgyChild } from "./agy-children.ts";
 import { getAgyBinary } from "./agy-diagnostics.ts";
 import type { AgyExecutionMode } from "./agy-profile.ts";
+import { sandboxAgyLaunch, type AgySandboxOptions } from "./agy-sandbox.ts";
 import { parseAgyLine } from "./events.ts";
 import { applyEvent, newTurnOutcome, type AgyActivity, type AgyTurnOutcome } from "./reducer.ts";
 
@@ -28,6 +29,10 @@ export interface AgyTurnRequest {
   effort?: AgyEffort;
   /** Working directory for the agy process. */
   cwd?: string;
+  /** Provider-owned absolute Gemini directory passed through --gemini_dir. */
+  geminiDir?: string;
+  /** Mandatory OS boundary for the official agy process. */
+  sandbox?: AgySandboxOptions;
   /** Overall turn timeout owned by Pi. One-shot mode also passes --print-timeout. */
   timeoutMs?: number;
   /**
@@ -94,7 +99,12 @@ export class AgyStallError extends Error {
 }
 
 function appendProcessArgs(args: string[], request: AgyTurnRequest): string[] {
-  if (request.cwd) args.push("--add-dir", request.cwd);
+  if (request.geminiDir) {
+    if (!path.isAbsolute(request.geminiDir)) {
+      throw new Error("agy geminiDir must be an absolute path.");
+    }
+    args.unshift(`--gemini_dir=${path.resolve(request.geminiDir)}`);
+  }
   if (request.conversationId) args.push("--conversation", request.conversationId);
   if (request.model) args.push("--model", request.model);
   if (request.effort) args.push("--effort", request.effort);
@@ -110,7 +120,6 @@ export function buildOneShotAgyArgs(request: AgyTurnRequest): string[] {
     [
       "--print",
       request.prompt,
-      "--dangerously-skip-permissions",
       "--disable-slash-commands",
       "--output-format",
       "stream-json",
@@ -123,14 +132,7 @@ export function buildOneShotAgyArgs(request: AgyTurnRequest): string[] {
 
 export function buildDriverAgyArgs(request: Omit<AgyTurnRequest, "prompt">): string[] {
   return appendProcessArgs(
-    [
-      "--input-format",
-      "stream-json",
-      "--output-format",
-      "stream-json",
-      "--dangerously-skip-permissions",
-      "--disable-slash-commands",
-    ],
+    ["--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands"],
     { ...request, prompt: "" },
   );
 }
@@ -144,7 +146,15 @@ export const buildAgyArgs = buildOneShotAgyArgs;
  * fails before producing any result event (missing binary, auth failure, …).
  */
 export async function runAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcome> {
-  const binary = request.binary ?? (request.spawnOverride ? "agy" : await getAgyBinary());
+  const binary =
+    request.binary ??
+    (request.spawnOverride ? "agy" : await getAgyBinary({ sandbox: request.sandbox }));
+  const args = buildOneShotAgyArgs(request);
+  // Preserve synchronous listener attachment for injected test children and
+  // ordinary rollback callers; only the mandatory secure path needs async setup.
+  const sandbox = request.sandbox?.required
+    ? await sandboxAgyLaunch(binary, args, request.sandbox)
+    : undefined;
   return new Promise((resolve, reject) => {
     if (request.signal?.aborted) {
       const outcome = newTurnOutcome();
@@ -155,8 +165,9 @@ export async function runAgyTurn(request: AgyTurnRequest): Promise<AgyTurnOutcom
       return;
     }
     const doSpawn = request.spawnOverride ?? spawn;
-    const child = doSpawn(binary, buildOneShotAgyArgs(request), {
+    const child = doSpawn(sandbox?.file ?? binary, sandbox?.args ?? args, {
       cwd: request.cwd,
+      env: sandbox?.env,
       stdio: ["ignore", "pipe", "pipe"],
       // Own process group so one negative-pid SIGKILL reaps agy's whole
       // tree on timeout/abort instead of leaving grandchildren running.

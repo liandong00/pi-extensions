@@ -1,7 +1,8 @@
 {
-  "name": "@tian.zuo/pi-antigravity",
-  "version": "0.9.0",
-  "description": "Use Antigravity (agy) models inside the pi coding agent via the agy stream-json RPC, with pi as the UI.",
+  "name": "@liandong00/pi-antigravity-secure",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Securely use the official Antigravity CLI as a Pi model backend with inference-only isolation.",
   "type": "module",
   "keywords": [
     "pi",
@@ -16,12 +17,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/TianZuo555/pi-extensions.git",
+    "url": "git+https://github.com/liandong00/pi-extensions.git",
     "directory": "packages/pi-antigravity"
   },
-  "homepage": "https://github.com/TianZuo555/pi-extensions#antigravity",
+  "homepage": "https://github.com/liandong00/pi-extensions#antigravity",
   "bugs": {
-    "url": "https://github.com/TianZuo555/pi-extensions/issues"
+    "url": "https://github.com/liandong00/pi-extensions/issues"
   },
   "files": [
     "index.ts",
@@ -52,8 +53,5 @@
     "@types/semver": "^7.8.0",
     "@types/which": "^3.0.4",
     "typescript": "^7.0.2"
-  },
-  "publishConfig": {
-    "access": "public"
   }
 }
