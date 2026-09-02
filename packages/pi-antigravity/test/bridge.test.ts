@@ -538,7 +538,6 @@ test("selectBridgedTools bridges Pi builtins and MCP adapter tools only", () => 
   ]);
 });
 
-
 test("createBridgeLifecycleManager handles start-success/add-failure, retry, and teardown", async () => {
   const bridge = new AgyPiBridge("pi-bridge-lifecycle");
   let mcpAddShouldFail = true;

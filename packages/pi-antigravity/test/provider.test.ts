@@ -110,7 +110,6 @@ test("piHistoryBootstrap is absent for a first-turn request and bounds old histo
   assert.ok(restored.length < 241_000);
 });
 
-
 test("mapUsage maps agy usage fields to pi usage", () => {
   const usage = mapUsage({
     input_tokens: 44909,

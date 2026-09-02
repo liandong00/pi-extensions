@@ -387,10 +387,7 @@ export function streamAntigravity(
             }),
           ).catch(() => {});
           await turnRuntime.runPromise(turnService.abortSecurityViolation);
-          const target =
-            mcpServer
-              ? ` MCP server "${mcpServer}"`
-              : "";
+          const target = mcpServer ? ` MCP server "${mcpServer}"` : "";
           throw new Error(
             `antigravity security violation: native tool "${activity.name}"${target} was requested; the isolated agy process was terminated.`,
           );
