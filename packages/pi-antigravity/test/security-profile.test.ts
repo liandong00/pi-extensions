@@ -103,6 +103,8 @@ test("registers one authenticated loopback MCP server in the exclusively locked 
     const instructions = await fs.readFile(broker.instructionsFile, "utf8");
     assert.match(instructions, /Use only MCP tools/);
     assert.match(instructions, /never attempt to bypass/);
+    assert.match(instructions, /calling one terminates this conversation immediately/);
+    assert.match(instructions, /argument `path`/);
     await unregisterSessionBridge(profile, broker);
     assert.deepEqual(JSON.parse(await fs.readFile(profile.globalMcpFile, "utf8")), {
       mcpServers: {},

@@ -4,7 +4,13 @@ import { AgySpawnError, AgyStallError, type AgyTurnRequest } from "../lib/agy-cl
 import { stallContinuationPrompt } from "../lib/prompt.ts";
 import { newTurnOutcome, type AgyTurnOutcome } from "../lib/reducer.ts";
 import type { AgyTurnExecutor } from "../lib/agy-driver.ts";
-import { AntigravityRuntime, createAntigravityRuntime, runAntigravity } from "../src/runtime.ts";
+import {
+  AntigravityNativeStrikeLimitError,
+  AntigravityRuntime,
+  NATIVE_TOOL_STRIKE_LIMIT,
+  createAntigravityRuntime,
+  runAntigravity,
+} from "../src/runtime.ts";
 
 function completedOutcome(conversationId: string): AgyTurnOutcome {
   return {
@@ -421,6 +427,58 @@ test("runtime security violation aborts the executor and makes the conversation 
     assert.equal(snapshot.conversationId, undefined);
     assert.equal(snapshot.turns, 0);
     assert.deepEqual(snapshot.conversationUsage, {});
+  } finally {
+    await runtime.dispose();
+  }
+});
+
+test("runtime stops spawning agy after three native-tool strikes on the same prompt", async () => {
+  let runs = 0;
+  let resolveRun: ((outcome: AgyTurnOutcome) => void) | undefined;
+  const executor: AgyTurnExecutor = {
+    run: async (request) => {
+      runs += 1;
+      request.onConversation?.(`strike-${runs}`);
+      return new Promise<AgyTurnOutcome>((resolve) => {
+        resolveRun = resolve;
+      });
+    },
+    snapshot: () => ({ mode: "persistent", state: "running", lifecycle: [] }),
+    close: async () => {
+      resolveRun?.({ ...completedOutcome("strike"), status: "ERROR" });
+    },
+  };
+  const runtime = createAntigravityRuntime(executor);
+  const service = runtime.runSync(AntigravityRuntime);
+  try {
+    await runAntigravity(runtime, service.setSession("/repo", undefined));
+    for (let i = 0; i < NATIVE_TOOL_STRIKE_LIMIT; i++) {
+      await runAntigravity(
+        runtime,
+        service.beginStreamTurn({ prompt: "same turn", modelId: "gemini-3.7-flash" }),
+      );
+      await runAntigravity(runtime, service.abortSecurityViolation);
+    }
+    assert.equal(runs, NATIVE_TOOL_STRIKE_LIMIT);
+    await assert.rejects(
+      () =>
+        runAntigravity(
+          runtime,
+          service.beginStreamTurn({ prompt: "same turn", modelId: "gemini-3.7-flash" }),
+        ),
+      (error: unknown) => {
+        assert.ok(error instanceof AntigravityNativeStrikeLimitError);
+        assert.match(error.message, /stopped after 3 native-tool security violations/);
+        assert.equal(error.count, NATIVE_TOOL_STRIKE_LIMIT);
+        return true;
+      },
+    );
+    assert.equal(runs, NATIVE_TOOL_STRIKE_LIMIT);
+    await runAntigravity(
+      runtime,
+      service.beginStreamTurn({ prompt: "next user message", modelId: "gemini-3.7-flash" }),
+    );
+    assert.equal(runs, NATIVE_TOOL_STRIKE_LIMIT + 1);
   } finally {
     await runtime.dispose();
   }

@@ -516,8 +516,8 @@ export function formatBridgeToolResult(text: string, isError: boolean): string {
   return [
     "## Pi tool result (authoritative)",
     isError
-      ? "Pi could not complete this operation. Do not use a native fallback; report the limitation."
-      : "Pi completed this operation. Continue from this result; do not verify it with a native tool.",
+      ? "Pi could not complete this operation. Do not use a native fallback — it will abort with no content. For read, the argument is `path`."
+      : "Pi completed this operation. Continue from this result. A native tool call will abort this conversation with no additional content.",
     "<pi-tool-result>",
     text,
     "</pi-tool-result>",
