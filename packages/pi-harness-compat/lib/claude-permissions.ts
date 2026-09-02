@@ -363,11 +363,14 @@ export function evaluateClaudePermission(
   const allow = firstMatch(policy.allow, request, "allow", projectRoot);
   if (allow)
     return { decision: "allow", reason: "Matched Claude allow rule.", matchedRule: allow.raw };
+  if (policy.defaultMode === "auto") {
+    return {
+      decision: "allow",
+      reason: "Claude auto mode allows unmatched operations; deny and explicit ask still apply.",
+    };
+  }
   return {
     decision: "ask",
-    reason:
-      policy.defaultMode === "auto"
-        ? "Claude auto-mode classification is intentionally not replicated."
-        : "No Claude permission rule matched.",
+    reason: "No Claude permission rule matched.",
   };
 }

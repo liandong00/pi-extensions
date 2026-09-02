@@ -105,7 +105,7 @@ test("settings chain merges global, project and local permissions without execut
   assert.deepEqual(untrusted.additionalDirectories, ["../shared"]);
 });
 
-test("deny wins over ask and allow; unmatched auto mode still asks", () => {
+test("deny wins over ask and allow; unmatched auto mode allows", () => {
   const parsed = parseClaudeSettings({
     permissions: {
       allow: ["Read(*)", "Bash(git *)"],
@@ -129,7 +129,7 @@ test("deny wins over ask and allow; unmatched auto mode still asks", () => {
       input: { path: "src/a.ts" },
       cwd: "/repo",
     }).decision,
-    "ask",
+    "allow",
   );
   const filePolicy = {
     ...parseClaudeSettings({
@@ -180,6 +180,50 @@ test("deny wins over ask and allow; unmatched auto mode still asks", () => {
     }).decision,
     "ask",
     "an allow rule must match both a symlink path and its canonical target",
+  );
+});
+
+test("auto mode keeps deny and explicit ask, and allows unmatched shell", () => {
+  const parsed = parseClaudeSettings({
+    permissions: {
+      allow: ["Bash(git status *)"],
+      ask: ["Bash(git push *)", "Read(/secret/**)"],
+      deny: ["Bash(git push --force*)", "Bash(rm -rf *)"],
+      defaultMode: "auto",
+    },
+  });
+  const policy = { ...parsed, sources: [], permissionRequestCommands: [], projectRoot: "/repo" };
+  assert.equal(
+    evaluateBashPermission(policy, {
+      toolName: "bash",
+      input: { command: "git push --force origin main" },
+      cwd: "/repo",
+    }).decision,
+    "deny",
+  );
+  assert.equal(
+    evaluateBashPermission(policy, {
+      toolName: "bash",
+      input: { command: "git push origin main" },
+      cwd: "/repo",
+    }).decision,
+    "ask",
+  );
+  assert.equal(
+    evaluateBashPermission(policy, {
+      toolName: "bash",
+      input: { command: "xargs echo" },
+      cwd: "/repo",
+    }).decision,
+    "allow",
+  );
+  assert.equal(
+    evaluateClaudePermission(policy, {
+      toolName: "read",
+      input: { path: "/secret/a.md" },
+      cwd: "/repo",
+    }).decision,
+    "ask",
   );
 });
 

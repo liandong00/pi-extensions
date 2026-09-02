@@ -142,7 +142,10 @@ export function evaluateBashPermission(
   );
   const denied = evaluations.find((result) => result.decision === "deny");
   if (denied) return denied;
-  if (parsed.complex || parsed.leaves.some(leafNeedsManualReview)) {
+  if (
+    policy.defaultMode !== "auto" &&
+    (parsed.complex || parsed.leaves.some(leafNeedsManualReview))
+  ) {
     return {
       decision: "ask",
       reason: "Shell command contains indirection or complex syntax and cannot be auto-approved.",

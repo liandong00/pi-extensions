@@ -271,7 +271,7 @@ export default function harnessCompat(pi: ExtensionAPI): void {
             "harness permissions: active",
             `Claude sources: ${claude.sources.join(", ") || "none"}`,
             `Claude rules: allow=${claude.allow.length} ask=${claude.ask.length} deny=${claude.deny.length}`,
-            `Claude defaultMode: ${claude.defaultMode ?? "unset"} (unmatched always asks)`,
+            `Claude defaultMode: ${claude.defaultMode ?? "unset"} (${claude.defaultMode === "auto" ? "unmatched allows; deny and explicit ask still apply" : "unmatched always asks"})`,
             `Codex profile: ${codex.profile} (${codex.source})`,
             `Codex network: ${codex.networkEnabled ? "enabled" : "denied"}`,
           ].join("\n"),
